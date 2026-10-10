@@ -1,0 +1,27 @@
+server:
+  port: ${SERVER_PORT:8081}
+
+spring:
+  application:
+    name: users-service
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5441}/${DB_NAME:users_db}
+    username: ${DB_USER:postgres}
+    password: ${DB_PASSWORD:postgres}
+  jpa:
+    hibernate:
+      ddl-auto: update
+    open-in-view: false
+    show-sql: false
+    properties:
+      hibernate:
+        format_sql: true
+
+# Credenciales del login (POST /api/auth/login)
+auth:
+  admin:
+    usuario: ${AUTH_ADMIN_USER:admin}
+    password: ${AUTH_ADMIN_PASSWORD:admin123}
+  operador:
+    usuario: ${AUTH_OPERADOR_USER:operador}
+    password: ${AUTH_OPERADOR_PASSWORD:operador123}
