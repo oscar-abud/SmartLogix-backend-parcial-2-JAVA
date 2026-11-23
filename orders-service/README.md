@@ -1,182 +1,158 @@
-# orders-service — Gestión de Pedidos
+# orders-service
 
-Microservicio Spring Boot 3.3 / Java 17 que registra los pedidos y sus detalles.
-Usa su propia base de datos PostgreSQL (patrón *Database per Service*).
+Microservicio de pedidos. Puerto **3003**, PostgreSQL `orders_db`.
 
-| Item | Valor |
-|---|---|
-| Puerto de la API | `8083` |
-| Base de datos | PostgreSQL 16, BD `orders_db`, puerto host `5443` |
-| Dependencia | **inventory-service** (`http://localhost:8082`) debe estar corriendo |
+Es la pieza que conecta los dos estilos de comunicación del sistema: llama a
+`inventory-service` de forma **síncrona** y publica en **SQS** de forma asíncrona.
 
-## Lógica de negocio clave
+> Documentación general: [`../README.md`](../README.md) ·
+> Arquitectura: [`../ARQUITECTURA.md`](../ARQUITECTURA.md)
 
-En `POST /api/orders` el cliente envía **solo** `usuarioId` y los items (`productoId`, `cantidad`).
-Por seguridad, el backend:
-1. Consulta cada producto en **inventory-service** (`GET /api/products/{id}`) para obtener su **precio real**. Así el cliente no puede imponer el precio.
-2. Guarda ese precio como `precioUnitario` de cada `DetallePedido`.
-3. Calcula `montoTotal = Σ (cantidad × precioUnitario)` con `BigDecimal`, redondeado a 2 decimales.
-4. Guarda el `Pedido` con estado `PENDIENTE`; sus detalles se persisten en cascada (`@OneToMany(cascade = CascadeType.ALL)`).
+---
 
-Si un producto no existe → **404**. Si inventory-service no responde → **503**.
-
-## Arquitectura en capas
+## Qué ocurre al crear un pedido
 
 ```
-cl.duoc.orders
-├── controller   → PedidoController
-├── service      → PedidoService + impl/PedidoServiceImpl (calcula el monto total)
-├── client       → InventoryClient (RestClient hacia inventory-service)
-├── repository   → PedidoRepository (@EntityGraph para traer los detalles)
-├── model        → Pedido ──@OneToMany(cascade ALL)──▶ DetallePedido, EstadoPedido (enum)
-├── dto          → PedidoCreateRequest, PedidoItemRequest, EstadoUpdateRequest, PedidoResponse, DetallePedidoResponse
-└── exception    → GlobalExceptionHandler (@RestControllerAdvice), ErrorResponse y excepciones propias
+POST /api/orders
+      │
+      ├─1─> GET /api/products/{id} en inventory-service   (SÍNCRONO)
+      │        propaga el JWT del cliente; obtiene el precio REAL
+      │
+      ├─2─> calcula montoTotal con BigDecimal y guarda en Postgres
+      │
+      └─3─> publica OrderCreatedEvent en SQS              (ASÍNCRONO)
+                    │
+                    └──> Lambda shipping ──> MongoDB Atlas
 ```
+
+1. **El cliente nunca envía precios.** Solo `productoId` y `cantidad`. El precio se
+   consulta a `inventory-service`, así que no se puede manipular el total.
+2. **El monto se calcula con `BigDecimal`** y se redondea a 2 decimales (`HALF_UP`).
+3. **La publicación en SQS va después del guardado y nunca lanza excepción.** Si la
+   mensajería falla, el error se registra pero el pedido queda creado: perder una
+   venta por un problema de cola sería peor que retrasar un envío.
+
+Por qué una cola y no otra llamada HTTP: ver
+[`../ARQUITECTURA.md` §6](../ARQUITECTURA.md).
+
+---
 
 ## Endpoints
 
-| Método | Ruta | Descripción | Respuestas |
-|---|---|---|---|
-| GET | `/api/orders/{id}` | Consulta un pedido con sus detalles | 200, 404 |
-| POST | `/api/orders` | Crea el pedido calculando el monto en el backend | **201**, 400, 404, 503 |
-| PATCH | `/api/orders/{id}/status` | Cambia solo el estado (`PENDIENTE`, `PAGADO`, `CANCELADO`) | 200, 400, 404 |
+Todos exigen `Authorization: Bearer <token>`. Tanto ADMIN como OPERADOR pueden
+operar con pedidos.
+
+| Método | Ruta | Respuestas |
+|---|---|---|
+| POST | `/api/orders` | 201 + `Location`, 400, 401, 404, 503 |
+| GET | `/api/orders/{id}` | 200, 401, 404 |
+| PATCH | `/api/orders/{id}/status` | 200, 400, 401, 404 |
+| GET | `/actuator/health` | 200 (público) |
+
+Estados válidos: `PENDIENTE` (inicial), `PAGADO`, `CANCELADO`.
+
+| Código | Cuándo |
+|---|---|
+| 404 | El producto no existe en `inventory-service`, o el pedido no existe |
+| 503 | `inventory-service` no responde o devuelve un error |
 
 ---
 
-## Despliegue local paso a paso
+## Ejemplos
 
-### Requisitos
-- Docker Desktop (en ejecución)
-- **inventory-service levantado en el puerto 8082** (ver su README) y con productos creados
-- Opción A además: JDK 17. **No hace falta instalar Maven**: el proyecto incluye Maven Wrapper (`mvnw` / `mvnw.cmd`).
-
-### Opción A — Base de datos en Docker + aplicación con Maven
 ```bash
-# 1. Levantar solo la base de datos PostgreSQL
-docker compose up -d db
+TOKEN=$(curl -s -X POST http://localhost:3001/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"usuario":"admin@smartlogix.cl","password":"admin123"}' | jq -r .token)
+A="Authorization: Bearer $TOKEN"
 
-# 2. Compilar y empaquetar (genera target/orders-service-1.0.0.jar)
-./mvnw clean package          # Windows CMD/PowerShell: mvnw.cmd clean package
-#   (con Maven instalado también sirve: mvn clean package)
-
-# 3. Ejecutar (por defecto busca inventory-service en http://localhost:8082)
-java -jar target/orders-service-1.0.0.jar
+# Crear pedido
+curl -s -X POST http://localhost:3003/api/orders -H "$A" \
+  -H 'Content-Type: application/json' \
+  -d '{"usuarioId":1,"items":[{"productoId":1,"cantidad":2}]}' | jq
 ```
 
-### Opción B — Todo en Docker (BD + aplicación)
-```bash
-docker compose up -d --build
-docker compose logs -f app
-```
-Dentro de Docker, la app llega a inventory-service mediante `INVENTORY_URL=http://host.docker.internal:8082`, configurado en `docker-compose.yml`.
-Si inventory corre en otra URL, cambia esa variable (o `inventory.base-url` en `application.yml`).
-
-### Detener y limpiar
-```bash
-docker compose down        # detiene los contenedores
-docker compose down -v     # además borra los datos
-```
-
----
-
-## Pruebas con cURL
-
-> En Windows, ejecuta los comandos en **Git Bash** (o impórtalos en Postman con *Import → Raw text*).
-> Los ejemplos asumen que en inventory-service existen el producto 1 (Notebook, $549.990) y el producto 2 (Mouse, $12.990,5). Ver el README de inventory.
-
-### Crear pedido → 201 Created
-```bash
-curl -i -X POST http://localhost:8083/api/orders \
-  -H "Content-Type: application/json" \
-  -d '{
-    "usuarioId": 1,
-    "items": [
-      { "productoId": 1, "cantidad": 2 },
-      { "productoId": 2, "cantidad": 3 }
-    ]
-  }'
-```
-Respuesta, con el monto calculado en el backend (2 × 549990 + 3 × 12990,5 = 1138951,5):
 ```json
 {
   "id": 1,
   "usuarioId": 1,
-  "fecha": "2026-10-10T22:45:48.893181",
-  "montoTotal": 1138951.5,
+  "fecha": "2026-11-22T22:04:29.346",
+  "montoTotal": 59980.0,
   "estado": "PENDIENTE",
   "detalles": [
-    { "id": 1, "productoId": 1, "cantidad": 2, "precioUnitario": 549990.0, "subtotal": 1099980.0 },
-    { "id": 2, "productoId": 2, "cantidad": 3, "precioUnitario": 12990.5, "subtotal": 38971.5 }
+    { "id": 1, "productoId": 1, "cantidad": 2, "precioUnitario": 29990.0, "subtotal": 59980.0 }
   ]
 }
 ```
-La respuesta incluye la cabecera `Location: http://localhost:8083/api/orders/1`.
 
-### Consultar pedido con detalles → 200 OK
 ```bash
-curl -i http://localhost:8083/api/orders/1
+curl -s http://localhost:3003/api/orders/1 -H "$A" | jq
+
+curl -s -X PATCH http://localhost:3003/api/orders/1/status -H "$A" \
+  -H 'Content-Type: application/json' -d '{"estado":"PAGADO"}' | jq
 ```
 
-### Cambiar estado → 200 OK
+### Errores
+
 ```bash
-curl -i -X PATCH http://localhost:8083/api/orders/1/status \
-  -H "Content-Type: application/json" \
-  -d '{ "estado": "PAGADO" }'
+curl -i http://localhost:3003/api/orders/1                       # 401 sin token
+
+curl -i -X POST http://localhost:3003/api/orders -H "$A" \
+  -H 'Content-Type: application/json' \
+  -d '{"usuarioId":1,"items":[{"productoId":999999,"cantidad":1}]}'   # 404
+
+curl -i -X POST http://localhost:3003/api/orders -H "$A" \
+  -H 'Content-Type: application/json' -d '{"usuarioId":1,"items":[]}' # 400
+
+# Degradación cuando inventory cae -> 503, no un 500 genérico
+docker compose stop inventory-service
+curl -i -X POST http://localhost:3003/api/orders -H "$A" \
+  -H 'Content-Type: application/json' \
+  -d '{"usuarioId":1,"items":[{"productoId":1,"cantidad":1}]}'
+docker compose start inventory-service
 ```
-Valores válidos: `PENDIENTE`, `PAGADO`, `CANCELADO`.
 
 ---
 
-## Pruebas de error
+## Configuración
 
-### 404 Not Found — Pedido inexistente
+| Variable | Por defecto | Descripción |
+|---|---|---|
+| `SERVER_PORT` | `3003` | |
+| `DB_HOST` / `DB_PORT` / `DB_NAME` | `localhost` / `5434` / `orders_db` | |
+| `DB_USER` / `DB_PASSWORD` | `postgres` / `postgres` | |
+| `JWT_SECRET` | secreto de desarrollo | **Debe coincidir** con el de `users-service` |
+| `INVENTORY_URL` | `http://localhost:3002` | En Docker: `http://inventory-service:3002` |
+| `SQS_QUEUE_URL` | *(vacío)* | URL de la cola. **Vacío = publicación desactivada** |
+| `AWS_REGION` | `us-east-1` | |
+
+### Trabajar en local sin AWS
+
+Si `SQS_QUEUE_URL` está vacío, `ShippingEventPublisher` registra un *warning* al
+arrancar y omite las publicaciones. El servicio funciona con normalidad sin
+credenciales de AWS; lo único que no ocurre es la generación del envío.
+
+En EC2 no hacen falta *access keys*: el `DefaultCredentialsProvider` las resuelve
+desde el **instance profile** (`LabInstanceProfile`).
+
+---
+
+## Ejecución
+
 ```bash
-curl -i http://localhost:8083/api/orders/999
-```
-```json
-{"timestamp":"2026-10-10T22:45:50.360","status":404,"error":"Not Found","message":"Pedido con id 999 no encontrado","path":"/api/orders/999"}
-```
-
-### 404 Not Found — Producto inexistente en inventory
-```bash
-curl -i -X POST http://localhost:8083/api/orders \
-  -H "Content-Type: application/json" \
-  -d '{"usuarioId":1,"items":[{"productoId":999,"cantidad":1}]}'
-```
-```json
-{"timestamp":"2026-10-10T22:45:49.797","status":404,"error":"Not Found","message":"Producto con id 999 no existe en inventory-service","path":"/api/orders"}
+docker compose up -d --build     # desde la raíz, todo el sistema
+./mvnw spring-boot:run           # solo este servicio (necesita inventory arriba)
+./mvnw -B verify                 # tests (4)
 ```
 
-### 400 Bad Request — Estado inválido
-```bash
-curl -i -X PATCH http://localhost:8083/api/orders/1/status \
-  -H "Content-Type: application/json" -d '{ "estado": "XYZ" }'
-```
-```json
-{"timestamp":"2026-10-10T22:45:49.594","status":400,"error":"Bad Request","message":"El cuerpo de la peticion es invalido o esta mal formado","path":"/api/orders/1/status"}
-```
+Los tests comprueban que el monto usa el precio del inventario y no el del cliente,
+y que al crear un pedido se publica el evento. Requieren **JDK 17**.
 
-### 400 Bad Request — Pedido sin items o cantidad inválida
-```bash
-curl -i -X POST http://localhost:8083/api/orders \
-  -H "Content-Type: application/json" -d '{"usuarioId":1,"items":[]}'
+### Clases relevantes
 
-curl -i -X POST http://localhost:8083/api/orders \
-  -H "Content-Type: application/json" \
-  -d '{"usuarioId":1,"items":[{"productoId":1,"cantidad":0}]}'
-```
-```json
-{"timestamp":"2026-10-10T22:45:50.179","status":400,"error":"Bad Request","message":"Error de validacion en los datos enviados","path":"/api/orders","details":["items[0].cantidad: La cantidad debe ser al menos 1"]}
-```
-
-### 503 Service Unavailable — inventory-service detenido
-```bash
-docker stop inventory-service
-curl -i -X POST http://localhost:8083/api/orders \
-  -H "Content-Type: application/json" \
-  -d '{"usuarioId":1,"items":[{"productoId":1,"cantidad":1}]}'
-docker start inventory-service
-```
-```json
-{"timestamp":"2026-10-10T22:46:47.581","status":503,"error":"Service Unavailable","message":"inventory-service no esta disponible. Intente nuevamente mas tarde","path":"/api/orders"}
-```
+| Clase | Rol |
+|---|---|
+| `client/InventoryClient` | Llamada síncrona con propagación del JWT y timeouts (3 s / 5 s) |
+| `messaging/OrderCreatedEvent` | Contrato del mensaje; su gemelo está en `lambdas/shipping-service` |
+| `messaging/ShippingEventPublisher` | Productor SQS; tolera que la cola no esté configurada |
+| `service/impl/PedidoServiceImpl` | Cálculo del total y disparo del evento |

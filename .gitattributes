@@ -1,0 +1,11 @@
+# Los scripts que se ejecutan dentro de contenedores Linux deben guardarse con LF,
+# aunque se editen en Windows. Con CRLF el shebang falla con "exit 127".
+* text=auto eol=lf
+*.sh        text eol=lf
+mvnw        text eol=lf
+Dockerfile  text eol=lf
+*.cmd       text eol=crlf
+mvnw.cmd    text eol=crlf
+*.jar       binary
+*.png binary
+*.jpg binary

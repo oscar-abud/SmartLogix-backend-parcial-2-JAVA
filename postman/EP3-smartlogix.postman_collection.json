@@ -1,0 +1,1653 @@
+{
+  "info": {
+    "name": "EP3 - SmartLogix (JWT + API Gateway + SQS + Lambda)",
+    "description": "Coleccion de pruebas de la EP3.\n\nCOMO USARLA\n1. Ejecuta primero la carpeta '0. Autenticacion': guarda los tokens en las\n   variables {{token}} (ADMIN) y {{operadorToken}} (OPERADOR).\n2. El resto de peticiones heredan el Bearer {{token}} de la coleccion.\n\nLOCAL vs NUBE\n- Local (docker compose): deja las variables users/inventory/orders como estan.\n- A traves del API Gateway: pon las TRES con la misma URL del Gateway, por ejemplo\n  https://abc123.execute-api.us-east-1.amazonaws.com/prod\n\nSustituye a la cabecera X-User-Role de la EP2, que ya no existe.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{token}}",
+        "type": "string"
+      }
+    ]
+  },
+  "variable": [
+    {
+      "key": "users",
+      "value": "http://localhost:3001"
+    },
+    {
+      "key": "inventory",
+      "value": "http://localhost:3002"
+    },
+    {
+      "key": "orders",
+      "value": "http://localhost:3003"
+    },
+    {
+      "key": "token",
+      "value": ""
+    },
+    {
+      "key": "operadorToken",
+      "value": ""
+    },
+    {
+      "key": "userId",
+      "value": ""
+    },
+    {
+      "key": "productoId",
+      "value": ""
+    },
+    {
+      "key": "productoId2",
+      "value": ""
+    },
+    {
+      "key": "pedidoId",
+      "value": ""
+    }
+  ],
+  "item": [
+    {
+      "name": "0. Autenticacion (ejecutar primero)",
+      "description": "Obtiene los JWT. Sin esto, todo lo demas responde 401.",
+      "item": [
+        {
+          "name": "Login ADMIN -> 200 + token",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Responde 200\", () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "pm.test(\"Devuelve un JWT\", () => pm.expect(b.token).to.be.a(\"string\").and.not.empty);",
+                  "pm.test(\"El JWT tiene 3 partes\", () => pm.expect(b.token.split(\".\").length).to.eql(3));",
+                  "pm.test(\"El rol es ADMIN\", () => pm.expect(b.rol).to.eql(\"ADMIN\"));",
+                  "pm.test(\"Tipo Bearer\", () => pm.expect(b.tipo).to.eql(\"Bearer\"));",
+                  "pm.collectionVariables.set(\"token\", b.token);",
+                  "console.log(\"Token ADMIN guardado, expira en \" + b.expiraEnSegundos + \" s\");"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{users}}/api/auth/login",
+              "host": [
+                "{{users}}"
+              ],
+              "path": [
+                "api",
+                "auth",
+                "login"
+              ]
+            },
+            "description": "Unica ruta publica del sistema. Guarda el token en {{token}}.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"usuario\": \"admin@smartlogix.cl\",\n  \"password\": \"admin123\"\n}"
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          }
+        },
+        {
+          "name": "Login OPERADOR -> 200 + token",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Responde 200\", () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "pm.test(\"El rol es OPERADOR\", () => pm.expect(b.rol).to.eql(\"OPERADOR\"));",
+                  "pm.collectionVariables.set(\"operadorToken\", b.token);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{users}}/api/auth/login",
+              "host": [
+                "{{users}}"
+              ],
+              "path": [
+                "api",
+                "auth",
+                "login"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"usuario\": \"operador@smartlogix.cl\",\n  \"password\": \"operador123\"\n}"
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          }
+        },
+        {
+          "name": "ERROR - Password incorrecta -> 401",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Responde 401\", () => pm.response.to.have.status(401));",
+                  "pm.test(\"No devuelve token\", () => pm.expect(pm.response.json().token).to.be.undefined);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{users}}/api/auth/login",
+              "host": [
+                "{{users}}"
+              ],
+              "path": [
+                "api",
+                "auth",
+                "login"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"usuario\": \"admin@smartlogix.cl\",\n  \"password\": \"equivocada\"\n}"
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          }
+        },
+        {
+          "name": "ERROR - Usuario inexistente -> 401",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Responde 401\", () => pm.response.to.have.status(401));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{users}}/api/auth/login",
+              "host": [
+                "{{users}}"
+              ],
+              "path": [
+                "api",
+                "auth",
+                "login"
+              ]
+            },
+            "description": "Mismo mensaje que con password incorrecta: no revela si el usuario existe.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"usuario\": \"fantasma@smartlogix.cl\",\n  \"password\": \"admin123\"\n}"
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          }
+        },
+        {
+          "name": "ERROR - Sin password -> 400",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Responde 400\", () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{users}}/api/auth/login",
+              "host": [
+                "{{users}}"
+              ],
+              "path": [
+                "api",
+                "auth",
+                "login"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"usuario\": \"admin@smartlogix.cl\"\n}"
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "1. users-service (3001)",
+      "item": [
+        {
+          "name": "Listar usuarios activos -> 200",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Responde 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"Devuelve un array\", () => pm.expect(pm.response.json()).to.be.an(\"array\"));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{users}}/api/users",
+              "host": [
+                "{{users}}"
+              ],
+              "path": [
+                "api",
+                "users"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Crear usuario (ADMIN) -> 201",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Responde 201\", () => pm.response.to.have.status(201));",
+                  "const b = pm.response.json();",
+                  "pm.collectionVariables.set(\"userId\", b.id);",
+                  "pm.test(\"No expone la password\", () => pm.expect(b.password).to.be.undefined);",
+                  "pm.test(\"Devuelve cabecera Location\", () => pm.expect(pm.response.headers.has(\"Location\")).to.be.true);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{users}}/api/users",
+              "host": [
+                "{{users}}"
+              ],
+              "path": [
+                "api",
+                "users"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"nombre\": \"Camila Rojas\",\n  \"email\": \"camila.rojas@smartlogix.cl\",\n  \"rut\": \"19876543-2\",\n  \"telefono\": \"+56912345678\",\n  \"password\": \"camila123\",\n  \"rol\": \"OPERADOR\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Obtener usuario por id -> 200",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Responde 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{users}}/api/users/{{userId}}",
+              "host": [
+                "{{users}}"
+              ],
+              "path": [
+                "api",
+                "users",
+                "{{userId}}"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Actualizar telefono -> 200",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Responde 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"Telefono actualizado\", () => pm.expect(pm.response.json().telefono).to.eql(\"+56998887777\"));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{users}}/api/users/{{userId}}",
+              "host": [
+                "{{users}}"
+              ],
+              "path": [
+                "api",
+                "users",
+                "{{userId}}"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"telefono\": \"+56998887777\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Desactivar usuario (ADMIN) -> 200",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Responde 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"Queda inactivo\", () => pm.expect(pm.response.json().active).to.eql(false));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{users}}/api/users/{{userId}}/status",
+              "host": [
+                "{{users}}"
+              ],
+              "path": [
+                "api",
+                "users",
+                "{{userId}}",
+                "status"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"active\": false\n}"
+            }
+          }
+        },
+        {
+          "name": "ERROR - Email duplicado -> 409",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Responde 409\", () => pm.response.to.have.status(409));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{users}}/api/users",
+              "host": [
+                "{{users}}"
+              ],
+              "path": [
+                "api",
+                "users"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"nombre\": \"Otro\",\n  \"email\": \"camila.rojas@smartlogix.cl\",\n  \"rut\": \"11222333-4\",\n  \"telefono\": \"+56911111111\",\n  \"password\": \"otro123\",\n  \"rol\": \"OPERADOR\"\n}"
+            }
+          }
+        },
+        {
+          "name": "ERROR - Datos invalidos -> 400",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Responde 400\", () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{users}}/api/users",
+              "host": [
+                "{{users}}"
+              ],
+              "path": [
+                "api",
+                "users"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"nombre\": \"\",\n  \"email\": \"no-es-un-email\",\n  \"rut\": \"123\",\n  \"password\": \"abc\",\n  \"rol\": \"JEFE\"\n}"
+            }
+          }
+        },
+        {
+          "name": "ERROR - Usuario inexistente -> 404",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Responde 404\", () => pm.response.to.have.status(404));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{users}}/api/users/999999",
+              "host": [
+                "{{users}}"
+              ],
+              "path": [
+                "api",
+                "users",
+                "999999"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Eliminar usuario (ADMIN) -> 204",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Responde 204\", () => pm.response.to.have.status(204));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{users}}/api/users/{{userId}}",
+              "host": [
+                "{{users}}"
+              ],
+              "path": [
+                "api",
+                "users",
+                "{{userId}}"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "2. inventory-service (3002)",
+      "item": [
+        {
+          "name": "Listar categorias -> 200",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Responde 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{inventory}}/api/categories",
+              "host": [
+                "{{inventory}}"
+              ],
+              "path": [
+                "api",
+                "categories"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Crear producto 1 (ADMIN) -> 201",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Responde 201\", () => pm.response.to.have.status(201));",
+                  "pm.collectionVariables.set(\"productoId\", pm.response.json().id);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{inventory}}/api/products",
+              "host": [
+                "{{inventory}}"
+              ],
+              "path": [
+                "api",
+                "products"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"sku\": \"SKU-EP3-001\",\n  \"nombre\": \"Teclado mecanico\",\n  \"descripcion\": \"Switches rojos\",\n  \"precio\": 29990,\n  \"stock\": 50,\n  \"categoriaId\": 1\n}"
+            }
+          }
+        },
+        {
+          "name": "Crear producto 2 (ADMIN) -> 201",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Responde 201\", () => pm.response.to.have.status(201));",
+                  "pm.collectionVariables.set(\"productoId2\", pm.response.json().id);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{inventory}}/api/products",
+              "host": [
+                "{{inventory}}"
+              ],
+              "path": [
+                "api",
+                "products"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"sku\": \"SKU-EP3-002\",\n  \"nombre\": \"Mouse inalambrico\",\n  \"descripcion\": \"2.4 GHz\",\n  \"precio\": 12990,\n  \"stock\": 80,\n  \"categoriaId\": 1\n}"
+            }
+          }
+        },
+        {
+          "name": "Listar productos -> 200",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Responde 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{inventory}}/api/products",
+              "host": [
+                "{{inventory}}"
+              ],
+              "path": [
+                "api",
+                "products"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Obtener producto por id -> 200",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Responde 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{inventory}}/api/products/{{productoId}}",
+              "host": [
+                "{{inventory}}"
+              ],
+              "path": [
+                "api",
+                "products",
+                "{{productoId}}"
+              ]
+            },
+            "description": "Es el endpoint que orders-service consulta, propagando el mismo JWT del cliente."
+          }
+        },
+        {
+          "name": "Actualizar stock (ADMIN) -> 200",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Responde 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"Stock actualizado\", () => pm.expect(pm.response.json().stock).to.eql(45));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{inventory}}/api/products/{{productoId}}/stock",
+              "host": [
+                "{{inventory}}"
+              ],
+              "path": [
+                "api",
+                "products",
+                "{{productoId}}",
+                "stock"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"stock\": 45\n}"
+            }
+          }
+        },
+        {
+          "name": "Actualizacion masiva de stock (ADMIN) -> 200",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Responde 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{inventory}}/api/products/bulk-stock",
+              "host": [
+                "{{inventory}}"
+              ],
+              "path": [
+                "api",
+                "products",
+                "bulk-stock"
+              ]
+            },
+            "description": "Semantica todo-o-nada: si un id no existe, no se aplica ningun cambio.",
+            "body": {
+              "mode": "raw",
+              "raw": "[\n  {\n    \"id\": \"{{productoId}}\",\n    \"newStock\": 40\n  },\n  {\n    \"id\": \"{{productoId2}}\",\n    \"newStock\": 75\n  }\n]"
+            }
+          }
+        },
+        {
+          "name": "ERROR - Producto inexistente -> 404",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Responde 404\", () => pm.response.to.have.status(404));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{inventory}}/api/products/999999",
+              "host": [
+                "{{inventory}}"
+              ],
+              "path": [
+                "api",
+                "products",
+                "999999"
+              ]
+            }
+          }
+        },
+        {
+          "name": "ERROR - Precio negativo -> 400",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Responde 400\", () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{inventory}}/api/products",
+              "host": [
+                "{{inventory}}"
+              ],
+              "path": [
+                "api",
+                "products"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"sku\": \"SKU-EP3-BAD\",\n  \"nombre\": \"Invalido\",\n  \"descripcion\": \"\",\n  \"precio\": -100,\n  \"stock\": 5,\n  \"categoriaId\": 1\n}"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "3. orders-service (3003)",
+      "description": "Crear un pedido dispara el flujo asincrono: orders publica en SQS y la Lambda de envios escribe en MongoDB Atlas.",
+      "item": [
+        {
+          "name": "Crear pedido -> 201 (publica en SQS)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Responde 201\", () => pm.response.to.have.status(201));",
+                  "const b = pm.response.json();",
+                  "pm.collectionVariables.set(\"pedidoId\", b.id);",
+                  "pm.test(\"El monto lo calcula el backend\", () => pm.expect(b.montoTotal).to.be.above(0));",
+                  "pm.test(\"Nace PENDIENTE\", () => pm.expect(b.estado).to.eql(\"PENDIENTE\"));",
+                  "pm.test(\"Tiene 2 detalles\", () => pm.expect(b.detalles.length).to.eql(2));",
+                  "console.log(\"Pedido \" + b.id + \" creado. Revisa CloudWatch: aws logs tail /aws/lambda/smartlogix-shipping --follow\");"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{orders}}/api/orders",
+              "host": [
+                "{{orders}}"
+              ],
+              "path": [
+                "api",
+                "orders"
+              ]
+            },
+            "description": "El precio NO se envia: orders lo consulta a inventory-service para que el cliente no pueda imponerlo.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"usuarioId\": 1,\n  \"items\": [\n    {\n      \"productoId\": \"{{productoId}}\",\n      \"cantidad\": 2\n    },\n    {\n      \"productoId\": \"{{productoId2}}\",\n      \"cantidad\": 1\n    }\n  ]\n}"
+            }
+          }
+        },
+        {
+          "name": "Obtener pedido con detalles -> 200",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Responde 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{orders}}/api/orders/{{pedidoId}}",
+              "host": [
+                "{{orders}}"
+              ],
+              "path": [
+                "api",
+                "orders",
+                "{{pedidoId}}"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Cambiar estado a PAGADO -> 200",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Responde 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"Queda PAGADO\", () => pm.expect(pm.response.json().estado).to.eql(\"PAGADO\"));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{orders}}/api/orders/{{pedidoId}}/status",
+              "host": [
+                "{{orders}}"
+              ],
+              "path": [
+                "api",
+                "orders",
+                "{{pedidoId}}",
+                "status"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"estado\": \"PAGADO\"\n}"
+            }
+          }
+        },
+        {
+          "name": "ERROR - Estado invalido -> 400",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Responde 400\", () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{orders}}/api/orders/{{pedidoId}}/status",
+              "host": [
+                "{{orders}}"
+              ],
+              "path": [
+                "api",
+                "orders",
+                "{{pedidoId}}",
+                "status"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"estado\": \"ENTREGADO\"\n}"
+            }
+          }
+        },
+        {
+          "name": "ERROR - Producto inexistente -> 404",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Responde 404\", () => pm.response.to.have.status(404));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{orders}}/api/orders",
+              "host": [
+                "{{orders}}"
+              ],
+              "path": [
+                "api",
+                "orders"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"usuarioId\": 1,\n  \"items\": [\n    {\n      \"productoId\": 999999,\n      \"cantidad\": 1\n    }\n  ]\n}"
+            }
+          }
+        },
+        {
+          "name": "ERROR - Pedido sin items -> 400",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Responde 400\", () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{orders}}/api/orders",
+              "host": [
+                "{{orders}}"
+              ],
+              "path": [
+                "api",
+                "orders"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"usuarioId\": 1,\n  \"items\": []\n}"
+            }
+          }
+        },
+        {
+          "name": "ERROR - Pedido inexistente -> 404",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Responde 404\", () => pm.response.to.have.status(404));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{orders}}/api/orders/999999",
+              "host": [
+                "{{orders}}"
+              ],
+              "path": [
+                "api",
+                "orders",
+                "999999"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "4. Seguridad JWT (lo nuevo de la EP3)",
+      "description": "Demuestra que el control de acceso ya no depende del cliente.\nContra el API Gateway, los 401 los devuelve la Lambda authorizer SIN que la\npeticion llegue a las EC2; en local los devuelve el filtro de cada microservicio.",
+      "item": [
+        {
+          "name": "Sin token -> 401 (users)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Responde 401\", () => pm.response.to.have.status(401));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{users}}/api/users",
+              "host": [
+                "{{users}}"
+              ],
+              "path": [
+                "api",
+                "users"
+              ]
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          }
+        },
+        {
+          "name": "Sin token -> 401 (inventory)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Responde 401\", () => pm.response.to.have.status(401));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{inventory}}/api/products",
+              "host": [
+                "{{inventory}}"
+              ],
+              "path": [
+                "api",
+                "products"
+              ]
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          }
+        },
+        {
+          "name": "Sin token -> 401 (orders)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Responde 401\", () => pm.response.to.have.status(401));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{orders}}/api/orders/1",
+              "host": [
+                "{{orders}}"
+              ],
+              "path": [
+                "api",
+                "orders",
+                "1"
+              ]
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          }
+        },
+        {
+          "name": "Token inventado -> 401",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Responde 401\", () => pm.response.to.have.status(401));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer token.totalmente.inventado"
+              }
+            ],
+            "url": {
+              "raw": "{{inventory}}/api/products",
+              "host": [
+                "{{inventory}}"
+              ],
+              "path": [
+                "api",
+                "products"
+              ]
+            },
+            "description": "Firma invalida: el validador lo rechaza antes de tocar la base de datos.",
+            "auth": {
+              "type": "noauth"
+            }
+          }
+        },
+        {
+          "name": "X-User-Role falsificada ya NO sirve -> 401",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Responde 401\", () => pm.response.to.have.status(401));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-User-Role",
+                "value": "ADMIN"
+              }
+            ],
+            "url": {
+              "raw": "{{users}}/api/users",
+              "host": [
+                "{{users}}"
+              ],
+              "path": [
+                "api",
+                "users"
+              ]
+            },
+            "description": "En la EP2 esta cabecera bastaba para pasar por ADMIN. Ahora se ignora.",
+            "auth": {
+              "type": "noauth"
+            }
+          }
+        },
+        {
+          "name": "OPERADOR no puede crear productos -> 403",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Responde 403\", () => pm.response.to.have.status(403));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{inventory}}/api/products",
+              "host": [
+                "{{inventory}}"
+              ],
+              "path": [
+                "api",
+                "products"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"sku\": \"SKU-EP3-403\",\n  \"nombre\": \"Prohibido\",\n  \"descripcion\": \"\",\n  \"precio\": 1000,\n  \"stock\": 1,\n  \"categoriaId\": 1\n}"
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{operadorToken}}",
+                  "type": "string"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "OPERADOR no puede crear usuarios -> 403",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Responde 403\", () => pm.response.to.have.status(403));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{users}}/api/users",
+              "host": [
+                "{{users}}"
+              ],
+              "path": [
+                "api",
+                "users"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"nombre\": \"Intruso\",\n  \"email\": \"intruso@smartlogix.cl\",\n  \"rut\": \"15555555-5\",\n  \"telefono\": \"+56900000000\",\n  \"password\": \"intruso123\",\n  \"rol\": \"ADMIN\"\n}"
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{operadorToken}}",
+                  "type": "string"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "OPERADOR no puede eliminar productos -> 403",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Responde 403\", () => pm.response.to.have.status(403));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{inventory}}/api/products/{{productoId}}",
+              "host": [
+                "{{inventory}}"
+              ],
+              "path": [
+                "api",
+                "products",
+                "{{productoId}}"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{operadorToken}}",
+                  "type": "string"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "OPERADOR si puede leer el catalogo -> 200",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Responde 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{inventory}}/api/products",
+              "host": [
+                "{{inventory}}"
+              ],
+              "path": [
+                "api",
+                "products"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{operadorToken}}",
+                  "type": "string"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "OPERADOR si puede crear pedidos -> 201",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Responde 201\", () => pm.response.to.have.status(201));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{orders}}/api/orders",
+              "host": [
+                "{{orders}}"
+              ],
+              "path": [
+                "api",
+                "orders"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"usuarioId\": 2,\n  \"items\": [\n    {\n      \"productoId\": \"{{productoId}}\",\n      \"cantidad\": 1\n    }\n  ]\n}"
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{operadorToken}}",
+                  "type": "string"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "5. Limpieza (opcional)",
+      "item": [
+        {
+          "name": "Eliminar producto 1 (ADMIN) -> 204",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Responde 204\", () => pm.response.to.have.status(204));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{inventory}}/api/products/{{productoId}}",
+              "host": [
+                "{{inventory}}"
+              ],
+              "path": [
+                "api",
+                "products",
+                "{{productoId}}"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Eliminar producto 2 (ADMIN) -> 204",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Responde 204\", () => pm.response.to.have.status(204));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{inventory}}/api/products/{{productoId2}}",
+              "host": [
+                "{{inventory}}"
+              ],
+              "path": [
+                "api",
+                "products",
+                "{{productoId2}}"
+              ]
+            }
+          }
+        },
+        {
+          "name": "ERROR - Eliminar otra vez -> 404",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Responde 404\", () => pm.response.to.have.status(404));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{inventory}}/api/products/{{productoId2}}",
+              "host": [
+                "{{inventory}}"
+              ],
+              "path": [
+                "api",
+                "products",
+                "{{productoId2}}"
+              ]
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

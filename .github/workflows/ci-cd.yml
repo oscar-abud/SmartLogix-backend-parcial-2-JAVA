@@ -1,0 +1,343 @@
+# ===========================================================================
+# Pipeline CI/CD de SmartLogix (IE4, IE5, IE6)
+#
+#   build-test ──┬─> docker-images ──┐
+#                └─> lambda-package ─┴─> provision-cloud ──> deploy-swarm ──> smoke-test
+#
+# build-test        compila y ejecuta los tests de los 3 microservicios y las 2 Lambdas
+# docker-images     construye y publica las imagenes en GHCR, etiquetadas con el SHA
+# lambda-package    empaqueta los uber-jar y los sube a S3
+# provision-cloud   APROVISIONA la infraestructura con CloudFormation (IE5):
+#                   SQS + DLQ, las 2 Lambdas, el API Gateway con su authorizer y CORS
+# deploy-swarm      actualiza el stack en el cluster Docker Swarm por SSH
+# smoke-test        verifica de punta a punta que la API responde y que protege
+#
+# SECRETS NECESARIOS (Settings > Secrets and variables > Actions):
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN   <- Learner Lab: CADUCAN
+#   AWS_REGION, LAB_ROLE_ARN, LAMBDA_S3_BUCKET
+#   JWT_SECRET, MONGODB_URI
+#   EC2_MANAGER_HOST, EC2_SSH_USER, EC2_SSH_KEY
+#
+# Las credenciales de AWS Academy caducan al cerrar el laboratorio: refrescarlas
+# con infra/scripts/refresh-gh-secrets.sh antes de cada demostracion.
+# ===========================================================================
+name: CI/CD SmartLogix
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ghcr.io/${{ github.repository_owner }}/smartlogix
+  STACK_NAME: smartlogix-infra
+  JAVA_VERSION: "17"
+
+jobs:
+
+  # =======================================================================
+  # 1. BUILD + TEST
+  # =======================================================================
+  build-test:
+    name: Build y test (${{ matrix.service }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service:
+          - users-service
+          - inventory-service
+          - orders-service
+          - lambdas/jwt-authorizer
+          - lambdas/shipping-service
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configurar JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      - name: Compilar y ejecutar tests
+        working-directory: ${{ matrix.service }}
+        run: |
+          chmod +x mvnw
+          ./mvnw -B verify
+
+      - name: Publicar el informe de tests
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-${{ strategy.job-index }}
+          path: ${{ matrix.service }}/target/surefire-reports/
+          if-no-files-found: ignore
+
+  # =======================================================================
+  # 2. IMAGENES DOCKER -> GHCR
+  # =======================================================================
+  docker-images:
+    name: Publicar imagen (${{ matrix.service }})
+    needs: build-test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        service: [users-service, inventory-service, orders-service]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Autenticarse en GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Construir y publicar
+        uses: docker/build-push-action@v6
+        with:
+          context: ./${{ matrix.service }}
+          push: true
+          tags: |
+            ${{ env.IMAGE_PREFIX }}-${{ matrix.service }}:${{ github.sha }}
+            ${{ env.IMAGE_PREFIX }}-${{ matrix.service }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # =======================================================================
+  # 3. EMPAQUETADO DE LAS LAMBDAS -> S3
+  # =======================================================================
+  lambda-package:
+    name: Empaquetar Lambdas y subirlas a S3
+    needs: build-test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      authorizer-key: ${{ steps.subir.outputs.authorizer-key }}
+      shipping-key: ${{ steps.subir.outputs.shipping-key }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      - name: Construir los uber-jar
+        run: |
+          for f in lambdas/jwt-authorizer lambdas/shipping-service; do
+            (cd "$f" && chmod +x mvnw && ./mvnw -B -q clean package -DskipTests)
+          done
+          ls -lh lambdas/*/target/*.jar
+
+      - name: Configurar credenciales de AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Subir los artefactos
+        id: subir
+        env:
+          BUCKET: ${{ secrets.LAMBDA_S3_BUCKET }}
+        run: |
+          set -euo pipefail
+          # Provision del bucket de artefactos: parte de la etapa de IaC (IE5).
+          if ! aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+            echo "Creando el bucket $BUCKET"
+            aws s3 mb "s3://$BUCKET"
+          fi
+
+          AUTH_KEY="lambdas/jwt-authorizer-${GITHUB_SHA}.jar"
+          SHIP_KEY="lambdas/shipping-service-${GITHUB_SHA}.jar"
+
+          aws s3 cp lambdas/jwt-authorizer/target/jwt-authorizer.jar     "s3://$BUCKET/$AUTH_KEY"
+          aws s3 cp lambdas/shipping-service/target/shipping-service.jar "s3://$BUCKET/$SHIP_KEY"
+
+          echo "authorizer-key=$AUTH_KEY" >> "$GITHUB_OUTPUT"
+          echo "shipping-key=$SHIP_KEY"   >> "$GITHUB_OUTPUT"
+
+  # =======================================================================
+  # 4. PROVISION DE LA INFRAESTRUCTURA CLOUD (IE5)
+  # =======================================================================
+  provision-cloud:
+    name: Aprovisionar infraestructura (CloudFormation)
+    needs: [docker-images, lambda-package]
+    runs-on: ubuntu-latest
+    outputs:
+      api-url: ${{ steps.salidas.outputs.api-url }}
+      queue-url: ${{ steps.salidas.outputs.queue-url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configurar credenciales de AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Validar el template
+        run: |
+          aws cloudformation validate-template \
+            --template-body file://infra/cloudformation/smartlogix-infra.yml > /dev/null
+          echo "Template valido"
+
+      - name: Desplegar el stack
+        run: |
+          set -euo pipefail
+          aws cloudformation deploy \
+            --template-file infra/cloudformation/smartlogix-infra.yml \
+            --stack-name "${STACK_NAME}" \
+            --no-fail-on-empty-changeset \
+            --parameter-overrides \
+              BackendHost='${{ secrets.EC2_MANAGER_HOST }}' \
+              LabRoleArn='${{ secrets.LAB_ROLE_ARN }}' \
+              JwtSecret='${{ secrets.JWT_SECRET }}' \
+              MongoUri='${{ secrets.MONGODB_URI }}' \
+              LambdaS3Bucket='${{ secrets.LAMBDA_S3_BUCKET }}' \
+              LambdaS3KeyAuthorizer='${{ needs.lambda-package.outputs.authorizer-key }}' \
+              LambdaS3KeyShipping='${{ needs.lambda-package.outputs.shipping-key }}' \
+              DeploymentNonce='${{ github.sha }}'
+
+      - name: Forzar la actualizacion del codigo de las Lambdas
+        # CloudFormation no siempre detecta el cambio de codigo cuando solo varia
+        # el contenido del objeto en S3; esto garantiza que corre la version nueva.
+        env:
+          BUCKET: ${{ secrets.LAMBDA_S3_BUCKET }}
+        run: |
+          set -euo pipefail
+          aws lambda update-function-code --function-name smartlogix-jwt-authorizer \
+            --s3-bucket "$BUCKET" --s3-key '${{ needs.lambda-package.outputs.authorizer-key }}' \
+            --publish > /dev/null
+          aws lambda update-function-code --function-name smartlogix-shipping \
+            --s3-bucket "$BUCKET" --s3-key '${{ needs.lambda-package.outputs.shipping-key }}' \
+            --publish > /dev/null
+          echo "Codigo de las Lambdas actualizado"
+
+      - name: Leer las salidas del stack
+        id: salidas
+        run: |
+          set -euo pipefail
+          leer() {
+            aws cloudformation describe-stacks --stack-name "${STACK_NAME}" \
+              --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text
+          }
+          API_URL=$(leer ApiUrl)
+          QUEUE_URL=$(leer ShippingQueueUrl)
+          echo "api-url=$API_URL"     >> "$GITHUB_OUTPUT"
+          echo "queue-url=$QUEUE_URL" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Infraestructura aprovisionada"
+            echo ""
+            echo "| Recurso | Valor |"
+            echo "|---|---|"
+            echo "| API Gateway | \`$API_URL\` |"
+            echo "| Cola SQS | \`$QUEUE_URL\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # =======================================================================
+  # 5. DESPLIEGUE EN EL CLUSTER DOCKER SWARM
+  # =======================================================================
+  deploy-swarm:
+    name: Desplegar en Docker Swarm (EC2)
+    needs: provision-cloud
+    runs-on: ubuntu-latest
+    steps:
+      - name: Actualizar el stack por SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.EC2_MANAGER_HOST }}
+          username: ${{ secrets.EC2_SSH_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script_stop: true
+          envs: GITHUB_SHA
+          script: |
+            set -euo pipefail
+            cd ~/SmartLogix-backend-parcial-2-JAVA || {
+              git clone https://github.com/${{ github.repository }}.git ~/SmartLogix-backend-parcial-2-JAVA
+              cd ~/SmartLogix-backend-parcial-2-JAVA
+            }
+            git fetch --all && git reset --hard origin/main
+            chmod +x infra/scripts/*.sh
+
+            export TAG='${{ github.sha }}'
+            export JWT_SECRET='${{ secrets.JWT_SECRET }}'
+            export SQS_QUEUE_URL='${{ needs.provision-cloud.outputs.queue-url }}'
+            export AWS_REGION='${{ secrets.AWS_REGION }}'
+            export DB_PASSWORD='${{ secrets.DB_PASSWORD }}'
+
+            ./infra/scripts/deploy-stack.sh
+
+  # =======================================================================
+  # 6. PRUEBA DE HUMO DE PUNTA A PUNTA (IE6 / IE15)
+  # =======================================================================
+  smoke-test:
+    name: Verificar la API desplegada
+    needs: [provision-cloud, deploy-swarm]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Esperar a que el rolling update termine
+        run: sleep 60
+
+      - name: Probar el flujo de autenticacion
+        env:
+          API: ${{ needs.provision-cloud.outputs.api-url }}
+        run: |
+          set -euo pipefail
+
+          echo "== 1. Sin token, el API Gateway debe cortar con 401 =="
+          CODIGO=$(curl -s -o /dev/null -w '%{http_code}' "$API/api/products")
+          echo "   GET /api/products sin token -> $CODIGO"
+          [ "$CODIGO" = "401" ] || { echo "ERROR: se esperaba 401"; exit 1; }
+
+          echo "== 2. Login para obtener el JWT =="
+          TOKEN=$(curl -s -X POST "$API/api/auth/login" \
+            -H 'Content-Type: application/json' \
+            -d '{"usuario":"admin@smartlogix.cl","password":"admin123"}' \
+            | python3 -c 'import sys,json; print(json.load(sys.stdin).get("token",""))')
+          [ -n "$TOKEN" ] || { echo "ERROR: el login no devolvio token"; exit 1; }
+          echo "   Token obtenido (${#TOKEN} caracteres)"
+
+          echo "== 3. Con token, la peticion llega al backend =="
+          CODIGO=$(curl -s -o /dev/null -w '%{http_code}' \
+            "$API/api/products" -H "Authorization: Bearer $TOKEN")
+          echo "   GET /api/products con token -> $CODIGO"
+          [ "$CODIGO" = "200" ] || { echo "ERROR: se esperaba 200"; exit 1; }
+
+          echo "== 4. Un token manipulado se rechaza =="
+          CODIGO=$(curl -s -o /dev/null -w '%{http_code}' \
+            "$API/api/products" -H "Authorization: Bearer token.falso.inventado")
+          echo "   GET /api/products con token invalido -> $CODIGO"
+          [ "$CODIGO" = "401" ] || { echo "ERROR: se esperaba 401"; exit 1; }
+
+          echo ""
+          echo "Prueba de humo superada: el API Gateway protege el backend y el login funciona."
+
+      - name: Resumen
+        if: always()
+        env:
+          API: ${{ needs.provision-cloud.outputs.api-url }}
+        run: |
+          {
+            echo "### Despliegue completado"
+            echo ""
+            echo "API publica: \`$API\`"
+            echo ""
+            echo "Imagenes: \`${{ env.IMAGE_PREFIX }}-<servicio>:${{ github.sha }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

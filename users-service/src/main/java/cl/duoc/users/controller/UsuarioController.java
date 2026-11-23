@@ -8,13 +8,13 @@ import cl.duoc.users.service.UsuarioService;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
-import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.support.ServletUriComponentsBuilder;
@@ -22,13 +22,17 @@ import org.springframework.web.servlet.support.ServletUriComponentsBuilder;
 import java.net.URI;
 import java.util.List;
 
+/**
+ * El rol del solicitante ya no se lee de la cabecera X-User-Role (falsificable):
+ * proviene del claim "rol" del JWT, que SecurityConfig convierte en la autoridad
+ * ROLE_ADMIN / ROLE_OPERADOR y que PreAuthorize evalua aqui.
+ *
+ * Respuestas: 401 si falta o es invalido el token, 403 si el rol no alcanza.
+ */
 @RestController
 @RequestMapping("/api/users")
 @RequiredArgsConstructor
 public class UsuarioController {
-
-    /** Cabecera con el rol de quien realiza la peticion (ADMIN u OPERADOR). */
-    public static final String ROLE_HEADER = "X-User-Role";
 
     private final UsuarioService usuarioService;
 
@@ -43,10 +47,9 @@ public class UsuarioController {
     }
 
     @PostMapping
-    public ResponseEntity<UsuarioResponse> crear(
-            @RequestHeader(value = ROLE_HEADER, required = false) String rol,
-            @Valid @RequestBody UsuarioCreateRequest request) {
-        UsuarioResponse creado = usuarioService.crear(request, rol);
+    @PreAuthorize("hasRole('ADMIN')")
+    public ResponseEntity<UsuarioResponse> crear(@Valid @RequestBody UsuarioCreateRequest request) {
+        UsuarioResponse creado = usuarioService.crear(request);
         URI location = ServletUriComponentsBuilder.fromCurrentRequest()
                 .path("/{id}").buildAndExpand(creado.id()).toUri();
         return ResponseEntity.created(location).body(creado);
@@ -60,18 +63,17 @@ public class UsuarioController {
     }
 
     @PatchMapping("/{id}/status")
+    @PreAuthorize("hasRole('ADMIN')")
     public ResponseEntity<UsuarioResponse> cambiarEstado(
-            @RequestHeader(value = ROLE_HEADER, required = false) String rol,
             @PathVariable Long id,
             @Valid @RequestBody StatusRequest request) {
-        return ResponseEntity.ok(usuarioService.cambiarEstado(id, request.active(), rol));
+        return ResponseEntity.ok(usuarioService.cambiarEstado(id, request.active()));
     }
 
     @DeleteMapping("/{id}")
-    public ResponseEntity<Void> eliminar(
-            @RequestHeader(value = ROLE_HEADER, required = false) String rol,
-            @PathVariable Long id) {
-        usuarioService.eliminar(id, rol);
+    @PreAuthorize("hasRole('ADMIN')")
+    public ResponseEntity<Void> eliminar(@PathVariable Long id) {
+        usuarioService.eliminar(id);
         return ResponseEntity.noContent().build();
     }
 }

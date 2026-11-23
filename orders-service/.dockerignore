@@ -1,4 +1,9 @@
 target/
 .idea/
 .vscode/
+.git/
+.github/
 *.md
+*.pem
+*.log
+.env
