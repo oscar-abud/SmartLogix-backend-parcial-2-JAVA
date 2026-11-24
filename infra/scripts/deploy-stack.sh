@@ -31,7 +31,18 @@ export JWT_EXPIRATION_MS="${JWT_EXPIRATION_MS:-3600000}"
 
 echo "==> Desplegando ${STACK_NAME} con TAG=${TAG}"
 # --with-registry-auth propaga las credenciales del registro a los workers.
-docker stack deploy -c "${STACK_FILE}" "${STACK_NAME}" --with-registry-auth --detach=false
+# Nota: "docker stack deploy" no admite --detach (si lo hace "service update"),
+# asi que devuelve el control enseguida y la convergencia se comprueba abajo.
+docker stack deploy -c "${STACK_FILE}" "${STACK_NAME}" --with-registry-auth
+
+echo
+echo "==> Esperando a que las replicas converjan"
+for i in $(seq 1 40); do
+  pendientes=$(docker stack services "${STACK_NAME}" --format '{{.Replicas}}'     | awk -F/ '{ if ($1 != $2) n++ } END { print n+0 }')
+  [ "${pendientes}" = "0" ] && { echo "    Todas las replicas activas."; break; }
+  [ "${i}" = "40" ] && echo "    AVISO: siguen ${pendientes} servicios sin converger."
+  sleep 10
+done
 
 echo
 echo "==> Estado de los servicios"
