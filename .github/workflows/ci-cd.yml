@@ -293,7 +293,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Esperar a que el rolling update termine
-        run: sleep 60
+        # Una espera fija no sirve: el update es start-first con parallelism 1 y
+        # 15 s de margen entre replicas, y cada Spring Boot tarda ~35 s en arrancar.
+        # Se sondea el login hasta que responda, con tope de 5 minutos.
+        env:
+          API: ${{ needs.provision-cloud.outputs.api-url }}
+        run: |
+          set -uo pipefail
+          for i in $(seq 1 30); do
+            CODIGO=$(curl -s -o /dev/null -w '%{http_code}' -m 15 \
+              -X POST "$API/api/auth/login" -H 'Content-Type: application/json' \
+              -d '{"usuario":"admin@smartlogix.cl","password":"admin123"}' || echo 000)
+            if [ "$CODIGO" = "200" ]; then
+              echo "API lista tras $((i*10)) s"
+              exit 0
+            fi
+            echo "  intento $i: login devuelve $CODIGO, esperando..."
+            sleep 10
+          done
+          echo "ERROR: la API no respondio tras 5 minutos"
+          exit 1
 
       - name: Probar el flujo de autenticacion
         env:
