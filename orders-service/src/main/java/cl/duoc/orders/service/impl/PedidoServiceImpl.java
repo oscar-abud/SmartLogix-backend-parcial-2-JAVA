@@ -7,6 +7,8 @@ import cl.duoc.orders.dto.PedidoResponse;
 import cl.duoc.orders.dto.ProductoInventarioDto;
 import cl.duoc.orders.exception.ResourceNotFoundException;
 import cl.duoc.orders.exception.ServiceUnavailableException;
+import cl.duoc.orders.messaging.OrderCreatedEvent;
+import cl.duoc.orders.messaging.ShippingEventPublisher;
 import cl.duoc.orders.model.DetallePedido;
 import cl.duoc.orders.model.EstadoPedido;
 import cl.duoc.orders.model.Pedido;
@@ -25,6 +27,7 @@ public class PedidoServiceImpl implements PedidoService {
 
     private final PedidoRepository pedidoRepository;
     private final InventoryClient inventoryClient;
+    private final ShippingEventPublisher shippingEventPublisher;
 
     @Override
     @Transactional(readOnly = true)
@@ -37,6 +40,10 @@ public class PedidoServiceImpl implements PedidoService {
      * desde inventory-service y se ignora cualquier precio que pudiera enviar el cliente.
      * Las llamadas HTTP se hacen fuera de la transaccion; el guardado (pedido + detalles en
      * cascada) ocurre en una sola transaccion dentro de save().
+     *
+     * Una vez persistido el pedido se publica el evento en SQS para que la funcion Lambda
+     * "shipping" genere el envio. La publicacion va DESPUES del save y nunca lanza
+     * excepcion, de modo que un fallo de mensajeria no deshace un pedido ya confirmado.
      */
     @Override
     public PedidoResponse crear(PedidoCreateRequest request) {
@@ -65,7 +72,10 @@ public class PedidoServiceImpl implements PedidoService {
         }
         pedido.setMontoTotal(total.setScale(2, RoundingMode.HALF_UP).doubleValue());
 
-        return PedidoResponse.from(pedidoRepository.save(pedido));
+        Pedido guardado = pedidoRepository.save(pedido);
+        shippingEventPublisher.publicar(OrderCreatedEvent.from(guardado));
+
+        return PedidoResponse.from(guardado);
     }
 
     @Override

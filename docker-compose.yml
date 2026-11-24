@@ -1,0 +1,150 @@
+# ---------------------------------------------------------------------------
+# Entorno LOCAL de desarrollo (IE2).
+#
+# Reemplaza a los tres docker-compose.yml independientes de la EP2: ahora todos
+# los servicios comparten la red "smartlogix-net", de modo que orders-service
+# alcanza a inventory-service por su nombre DNS y ya no hace falta el rodeo por
+# host.docker.internal.
+#
+# Arranque:   docker compose up -d --build
+# Logs:       docker compose logs -f orders-service
+# Apagado:    docker compose down          (anadir -v para borrar los datos)
+#
+# Para el despliegue en el clúster se usa docker-stack.yml, no este archivo.
+# ---------------------------------------------------------------------------
+name: smartlogix
+
+services:
+
+  # --------------------------- Bases de datos ---------------------------
+  users-db:
+    image: postgres:16-alpine
+    container_name: users-db
+    environment:
+      POSTGRES_DB: users_db
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+    ports:
+      - "${USERS_DB_PORT:-5432}:5432"
+    volumes:
+      - users_data:/var/lib/postgresql/data
+    networks: [smartlogix-net]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d users_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  inventory-db:
+    image: postgres:16-alpine
+    container_name: inventory-db
+    environment:
+      POSTGRES_DB: inventory_db
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+    ports:
+      - "${INVENTORY_DB_PORT:-5433}:5432"
+    volumes:
+      - inventory_data:/var/lib/postgresql/data
+    networks: [smartlogix-net]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d inventory_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  orders-db:
+    image: postgres:16-alpine
+    container_name: orders-db
+    environment:
+      POSTGRES_DB: orders_db
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+    ports:
+      - "${ORDERS_DB_PORT:-5434}:5432"
+    volumes:
+      - orders_data:/var/lib/postgresql/data
+    networks: [smartlogix-net]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d orders_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # --------------------------- Microservicios ---------------------------
+  users-service:
+    build: ./users-service
+    image: ghcr.io/oscar-abud/smartlogix-users-service:local
+    container_name: users-service
+    environment:
+      SERVER_PORT: 3001
+      DB_HOST: users-db
+      DB_PORT: 5432
+      DB_NAME: users_db
+      DB_USER: ${DB_USER:-postgres}
+      DB_PASSWORD: ${DB_PASSWORD:-postgres}
+      JWT_SECRET: ${JWT_SECRET:-smartlogix-dev-secret-cambiar-en-produccion-minimo-32-bytes}
+      JWT_EXPIRATION_MS: ${JWT_EXPIRATION_MS:-3600000}
+    ports:
+      - "3001:3001"
+    depends_on:
+      users-db:
+        condition: service_healthy
+    networks: [smartlogix-net]
+    restart: unless-stopped
+
+  inventory-service:
+    build: ./inventory-service
+    image: ghcr.io/oscar-abud/smartlogix-inventory-service:local
+    container_name: inventory-service
+    environment:
+      SERVER_PORT: 3002
+      DB_HOST: inventory-db
+      DB_PORT: 5432
+      DB_NAME: inventory_db
+      DB_USER: ${DB_USER:-postgres}
+      DB_PASSWORD: ${DB_PASSWORD:-postgres}
+      JWT_SECRET: ${JWT_SECRET:-smartlogix-dev-secret-cambiar-en-produccion-minimo-32-bytes}
+    ports:
+      - "3002:3002"
+    depends_on:
+      inventory-db:
+        condition: service_healthy
+    networks: [smartlogix-net]
+    restart: unless-stopped
+
+  orders-service:
+    build: ./orders-service
+    image: ghcr.io/oscar-abud/smartlogix-orders-service:local
+    container_name: orders-service
+    environment:
+      SERVER_PORT: 3003
+      DB_HOST: orders-db
+      DB_PORT: 5432
+      DB_NAME: orders_db
+      DB_USER: ${DB_USER:-postgres}
+      DB_PASSWORD: ${DB_PASSWORD:-postgres}
+      JWT_SECRET: ${JWT_SECRET:-smartlogix-dev-secret-cambiar-en-produccion-minimo-32-bytes}
+      # DNS interno de la red compartida: ya no hace falta host.docker.internal.
+      INVENTORY_URL: http://inventory-service:3002
+      # Vacio en local: sin credenciales de AWS la publicacion a SQS se omite.
+      SQS_QUEUE_URL: ${SQS_QUEUE_URL:-}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+    ports:
+      - "3003:3003"
+    depends_on:
+      orders-db:
+        condition: service_healthy
+      inventory-service:
+        condition: service_started
+    networks: [smartlogix-net]
+    restart: unless-stopped
+
+networks:
+  smartlogix-net:
+    driver: bridge
+
+volumes:
+  users_data:
+  inventory_data:
+  orders_data:

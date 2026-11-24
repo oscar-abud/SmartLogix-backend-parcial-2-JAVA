@@ -7,9 +7,9 @@ import cl.duoc.users.exception.ConflictException;
 import cl.duoc.users.exception.ResourceNotFoundException;
 import cl.duoc.users.model.Usuario;
 import cl.duoc.users.repository.UsuarioRepository;
-import cl.duoc.users.service.RoleValidator;
 import cl.duoc.users.service.UsuarioService;
 import lombok.RequiredArgsConstructor;
+import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -20,7 +20,7 @@ import java.util.List;
 public class UsuarioServiceImpl implements UsuarioService {
 
     private final UsuarioRepository usuarioRepository;
-    private final RoleValidator roleValidator;
+    private final PasswordEncoder passwordEncoder;
 
     @Override
     @Transactional(readOnly = true)
@@ -38,9 +38,7 @@ public class UsuarioServiceImpl implements UsuarioService {
 
     @Override
     @Transactional
-    public UsuarioResponse crear(UsuarioCreateRequest request, String rolSolicitante) {
-        roleValidator.requireAdmin(rolSolicitante);
-
+    public UsuarioResponse crear(UsuarioCreateRequest request) {
         if (usuarioRepository.existsByEmail(request.email())) {
             throw new ConflictException("Ya existe un usuario con el email " + request.email());
         }
@@ -53,7 +51,7 @@ public class UsuarioServiceImpl implements UsuarioService {
                 .email(request.email())
                 .rut(request.rut())
                 .telefono(request.telefono())
-                .password(request.password())
+                .password(passwordEncoder.encode(request.password()))
                 .rol(request.rol())
                 .active(true)
                 .build();
@@ -71,15 +69,14 @@ public class UsuarioServiceImpl implements UsuarioService {
             usuario.setTelefono(request.telefono());
         }
         if (request.password() != null) {
-            usuario.setPassword(request.password());
+            usuario.setPassword(passwordEncoder.encode(request.password()));
         }
         return UsuarioResponse.from(usuarioRepository.save(usuario));
     }
 
     @Override
     @Transactional
-    public UsuarioResponse cambiarEstado(Long id, Boolean active, String rolSolicitante) {
-        roleValidator.requireAdmin(rolSolicitante);
+    public UsuarioResponse cambiarEstado(Long id, Boolean active) {
         Usuario usuario = buscar(id);
         usuario.setActive(active);
         return UsuarioResponse.from(usuarioRepository.save(usuario));
@@ -87,8 +84,7 @@ public class UsuarioServiceImpl implements UsuarioService {
 
     @Override
     @Transactional
-    public void eliminar(Long id, String rolSolicitante) {
-        roleValidator.requireAdmin(rolSolicitante);
+    public void eliminar(Long id) {
         Usuario usuario = buscar(id);
         usuarioRepository.delete(usuario);
     }

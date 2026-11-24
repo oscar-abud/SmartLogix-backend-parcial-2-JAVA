@@ -1,0 +1,883 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  SmartLogix EP3 - Infraestructura serverless y de mensajeria.
+  Aprovisiona la cola SQS con su DLQ, las dos funciones Lambda (validador de JWT y
+  microservicio de envios) y el API Gateway REST que publica los microservicios
+  desplegados en el cluster Docker Swarm sobre EC2.
+
+  El stack lo despliega el pipeline de GitHub Actions (job provision-cloud):
+    aws cloudformation deploy --template-file infra/cloudformation/smartlogix-infra.yml ...
+
+# ===========================================================================
+# PARAMETROS
+# ===========================================================================
+Parameters:
+
+  BackendHost:
+    Type: String
+    Description: >
+      DNS publico o Elastic IP del nodo MANAGER del Swarm. El API Gateway enruta
+      hacia el por HTTP_PROXY usando el routing mesh de Swarm.
+    AllowedPattern: "^[A-Za-z0-9.\\-]+$"
+
+  LabRoleArn:
+    Type: String
+    Description: >
+      ARN del rol de ejecucion de las Lambdas. En AWS Academy Learner Lab NO se
+      pueden crear roles IAM, por eso se reutiliza LabRole en vez de crear uno.
+      Obtenerlo con: aws iam get-role --role-name LabRole --query Role.Arn --output text
+
+  JwtSecret:
+    Type: String
+    NoEcho: true
+    Description: Secreto HS256 compartido con users-service. Minimo 32 bytes.
+    MinLength: 32
+
+  MongoUri:
+    Type: String
+    NoEcho: true
+    Description: Cadena de conexion de MongoDB Atlas para la base de envios.
+
+  MongoDb:
+    Type: String
+    Default: smartlogix
+    Description: Nombre de la base de datos de Atlas.
+
+  LambdaS3Bucket:
+    Type: String
+    Description: Bucket de S3 donde el pipeline sube los uber-jar de las Lambdas.
+
+  LambdaS3KeyAuthorizer:
+    Type: String
+    Description: Clave en S3 del jar del validador de JWT.
+
+  LambdaS3KeyShipping:
+    Type: String
+    Description: Clave en S3 del jar del microservicio de envios.
+
+  AllowedOrigin:
+    Type: String
+    Default: "*"
+    Description: Origen permitido por CORS. En produccion, el dominio del frontend.
+
+  AllowedSourceIp:
+    Type: String
+    Default: "0.0.0.0/0"
+    Description: >
+      Rango de IPs al que la Resource Policy del API Gateway permite invocar la API.
+      Dejar 0.0.0.0/0 para una API publica, o restringir a una red concreta.
+
+  StageName:
+    Type: String
+    Default: prod
+  DeploymentNonce:
+    Type: String
+    Default: manual
+    Description: >
+      Valor que cambia en cada ejecucion del pipeline (el SHA del commit).
+      Sin el, CloudFormation reutiliza el mismo AWS::ApiGateway::Deployment y los
+      cambios en los metodos nunca llegarian al stage publicado.
+
+
+# ===========================================================================
+# RECURSOS
+# ===========================================================================
+Resources:
+
+  # ---------------------------------------------------------------------
+  # Mensajeria asincrona (IE11 / IE14)
+  # orders-service publica -> SQS -> Lambda shipping consume
+  # ---------------------------------------------------------------------
+  ShippingDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: smartlogix-shipping-dlq
+      MessageRetentionPeriod: 1209600   # 14 dias, el maximo
+
+  ShippingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: smartlogix-shipping-queue
+      # Debe ser >= al timeout de la Lambda, si no SQS reentrega un mensaje que
+      # todavia se esta procesando.
+      VisibilityTimeout: 60
+      MessageRetentionPeriod: 345600    # 4 dias
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ShippingDlq.Arn
+        maxReceiveCount: 3              # tras 3 intentos fallidos, a la DLQ
+
+  # ---------------------------------------------------------------------
+  # Funciones Lambda (IE10 / IE13)
+  # ---------------------------------------------------------------------
+  JwtAuthorizerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: smartlogix-jwt-authorizer
+      Description: Valida el JWT de las peticiones antes de que lleguen al backend
+      Runtime: java17
+      Handler: cl.duoc.authorizer.JwtAuthorizerHandler::handleRequest
+      Role: !Ref LabRoleArn
+      MemorySize: 512
+      Timeout: 10
+      Code:
+        S3Bucket: !Ref LambdaS3Bucket
+        S3Key: !Ref LambdaS3KeyAuthorizer
+      Environment:
+        Variables:
+          JWT_SECRET: !Ref JwtSecret
+          JWT_ISSUER: smartlogix-users
+
+  ShippingFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: smartlogix-shipping
+      Description: Microservicio de envios - consume SQS y persiste en MongoDB Atlas
+      Runtime: java17
+      Handler: cl.duoc.shipping.ShippingHandler::handleRequest
+      Role: !Ref LabRoleArn
+      MemorySize: 512
+      Timeout: 30
+      Code:
+        S3Bucket: !Ref LambdaS3Bucket
+        S3Key: !Ref LambdaS3KeyShipping
+      Environment:
+        Variables:
+          MONGODB_URI: !Ref MongoUri
+          MONGODB_DB: !Ref MongoDb
+
+  # Conecta la cola con la funcion: es lo que hace que el flujo sea asincrono
+  # de extremo a extremo sin que nadie tenga que hacer polling.
+  ShippingEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt ShippingQueue.Arn
+      FunctionName: !GetAtt ShippingFunction.Arn
+      BatchSize: 5
+      Enabled: true
+
+  # ---------------------------------------------------------------------
+  # API Gateway REST (IE12)
+  # ---------------------------------------------------------------------
+  RestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: smartlogix-api
+      Description: Punto de entrada unico de SmartLogix
+      EndpointConfiguration:
+        Types: [REGIONAL]
+      # Resource Policy: capa de control de acceso a nivel de infraestructura,
+      # independiente del JWT. Permite cerrar la API por rango de IPs sin tocar codigo.
+      Policy:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action: "execute-api:Invoke"
+            Resource: "execute-api:/*"
+          - Effect: Deny
+            Principal: "*"
+            Action: "execute-api:Invoke"
+            Resource: "execute-api:/*"
+            Condition:
+              NotIpAddress:
+                aws:SourceIp: !Ref AllowedSourceIp
+
+  # El validador externo del JWT. TTL de 300 s: API Gateway cachea la politica
+  # por token, de ahi que el authorizer devuelva un Resource con comodin.
+  JwtAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: smartlogix-jwt-authorizer
+      RestApiId: !Ref RestApi
+      Type: TOKEN
+      IdentitySource: method.request.header.Authorization
+      AuthorizerUri: !Sub
+        - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${Arn}/invocations"
+        - Arn: !GetAtt JwtAuthorizerFunction.Arn
+      AuthorizerResultTtlInSeconds: 300
+
+  AuthorizerInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt JwtAuthorizerFunction.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/authorizers/${JwtAuthorizer}"
+
+  # --------------------------- Arbol de recursos ---------------------------
+  ApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: api
+
+  AuthResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref ApiResource
+      PathPart: auth
+
+  AuthProxyResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref AuthResource
+      PathPart: "{proxy+}"
+
+  UsersResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref ApiResource
+      PathPart: users
+
+  UsersProxyResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref UsersResource
+      PathPart: "{proxy+}"
+
+  ProductsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref ApiResource
+      PathPart: products
+
+  ProductsProxyResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref ProductsResource
+      PathPart: "{proxy+}"
+
+  CategoriesResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref ApiResource
+      PathPart: categories
+
+  CategoriesProxyResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref CategoriesResource
+      PathPart: "{proxy+}"
+
+  OrdersResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref ApiResource
+      PathPart: orders
+
+  OrdersProxyResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref OrdersResource
+      PathPart: "{proxy+}"
+
+  # --------------------------- Metodos: /api/auth ---------------------------
+  # El login es la unica ruta SIN authorizer: es donde se obtiene el token.
+  AuthMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref AuthResource
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      Integration:
+        Type: HTTP_PROXY
+        IntegrationHttpMethod: ANY
+        Uri: !Sub "http://${BackendHost}:3001/api/auth"
+        ConnectionType: INTERNET
+
+  AuthProxyMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref AuthProxyResource
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      RequestParameters:
+        method.request.path.proxy: true
+      Integration:
+        Type: HTTP_PROXY
+        IntegrationHttpMethod: ANY
+        Uri: !Sub "http://${BackendHost}:3001/api/auth/{proxy}"
+        ConnectionType: INTERNET
+        RequestParameters:
+          integration.request.path.proxy: method.request.path.proxy
+
+  AuthOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref AuthResource
+      HttpMethod: OPTIONS
+      # Critico: el preflight NO puede exigir token. Si llevara el authorizer,
+      # el navegador recibiria 401 en el OPTIONS y nunca enviaria la peticion real.
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,PATCH,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+              method.response.header.Access-Control-Max-Age: "'3600'"
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Max-Age: true
+
+  AuthProxyOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref AuthProxyResource
+      HttpMethod: OPTIONS
+      # Critico: el preflight NO puede exigir token. Si llevara el authorizer,
+      # el navegador recibiria 401 en el OPTIONS y nunca enviaria la peticion real.
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,PATCH,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+              method.response.header.Access-Control-Max-Age: "'3600'"
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Max-Age: true
+
+  # --------------------------- Metodos: /api/users ---------------------------
+  UsersMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref UsersResource
+      HttpMethod: ANY
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref JwtAuthorizer
+      RequestParameters:
+        method.request.header.Authorization: false
+      Integration:
+        Type: HTTP_PROXY
+        IntegrationHttpMethod: ANY
+        Uri: !Sub "http://${BackendHost}:3001/api/users"
+        ConnectionType: INTERNET
+        RequestParameters:
+          # El authorizer consume la cabecera Authorization, asi que hay que
+          # reenviarla explicitamente: los microservicios tambien validan el JWT.
+          integration.request.header.Authorization: method.request.header.Authorization
+          integration.request.header.X-User-Role: context.authorizer.rol
+          integration.request.header.X-User-Id: context.authorizer.uid
+
+  UsersProxyMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref UsersProxyResource
+      HttpMethod: ANY
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref JwtAuthorizer
+      RequestParameters:
+        method.request.path.proxy: true
+        method.request.header.Authorization: false
+      Integration:
+        Type: HTTP_PROXY
+        IntegrationHttpMethod: ANY
+        Uri: !Sub "http://${BackendHost}:3001/api/users/{proxy}"
+        ConnectionType: INTERNET
+        RequestParameters:
+          integration.request.path.proxy: method.request.path.proxy
+          integration.request.header.Authorization: method.request.header.Authorization
+          integration.request.header.X-User-Role: context.authorizer.rol
+          integration.request.header.X-User-Id: context.authorizer.uid
+
+  UsersOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref UsersResource
+      HttpMethod: OPTIONS
+      # Critico: el preflight NO puede exigir token. Si llevara el authorizer,
+      # el navegador recibiria 401 en el OPTIONS y nunca enviaria la peticion real.
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,PATCH,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+              method.response.header.Access-Control-Max-Age: "'3600'"
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Max-Age: true
+
+  UsersProxyOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref UsersProxyResource
+      HttpMethod: OPTIONS
+      # Critico: el preflight NO puede exigir token. Si llevara el authorizer,
+      # el navegador recibiria 401 en el OPTIONS y nunca enviaria la peticion real.
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,PATCH,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+              method.response.header.Access-Control-Max-Age: "'3600'"
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Max-Age: true
+
+  # --------------------------- Metodos: /api/products ---------------------------
+  ProductsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref ProductsResource
+      HttpMethod: ANY
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref JwtAuthorizer
+      RequestParameters:
+        method.request.header.Authorization: false
+      Integration:
+        Type: HTTP_PROXY
+        IntegrationHttpMethod: ANY
+        Uri: !Sub "http://${BackendHost}:3002/api/products"
+        ConnectionType: INTERNET
+        RequestParameters:
+          integration.request.header.Authorization: method.request.header.Authorization
+          integration.request.header.X-User-Role: context.authorizer.rol
+          integration.request.header.X-User-Id: context.authorizer.uid
+
+  ProductsProxyMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref ProductsProxyResource
+      HttpMethod: ANY
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref JwtAuthorizer
+      RequestParameters:
+        method.request.path.proxy: true
+        method.request.header.Authorization: false
+      Integration:
+        Type: HTTP_PROXY
+        IntegrationHttpMethod: ANY
+        Uri: !Sub "http://${BackendHost}:3002/api/products/{proxy}"
+        ConnectionType: INTERNET
+        RequestParameters:
+          integration.request.path.proxy: method.request.path.proxy
+          integration.request.header.Authorization: method.request.header.Authorization
+          integration.request.header.X-User-Role: context.authorizer.rol
+          integration.request.header.X-User-Id: context.authorizer.uid
+
+  ProductsOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref ProductsResource
+      HttpMethod: OPTIONS
+      # Critico: el preflight NO puede exigir token. Si llevara el authorizer,
+      # el navegador recibiria 401 en el OPTIONS y nunca enviaria la peticion real.
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,PATCH,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+              method.response.header.Access-Control-Max-Age: "'3600'"
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Max-Age: true
+
+  ProductsProxyOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref ProductsProxyResource
+      HttpMethod: OPTIONS
+      # Critico: el preflight NO puede exigir token. Si llevara el authorizer,
+      # el navegador recibiria 401 en el OPTIONS y nunca enviaria la peticion real.
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,PATCH,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+              method.response.header.Access-Control-Max-Age: "'3600'"
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Max-Age: true
+
+  # --------------------------- Metodos: /api/categories ---------------------------
+  CategoriesMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref CategoriesResource
+      HttpMethod: ANY
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref JwtAuthorizer
+      RequestParameters:
+        method.request.header.Authorization: false
+      Integration:
+        Type: HTTP_PROXY
+        IntegrationHttpMethod: ANY
+        Uri: !Sub "http://${BackendHost}:3002/api/categories"
+        ConnectionType: INTERNET
+        RequestParameters:
+          integration.request.header.Authorization: method.request.header.Authorization
+          integration.request.header.X-User-Role: context.authorizer.rol
+          integration.request.header.X-User-Id: context.authorizer.uid
+
+  CategoriesProxyMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref CategoriesProxyResource
+      HttpMethod: ANY
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref JwtAuthorizer
+      RequestParameters:
+        method.request.path.proxy: true
+        method.request.header.Authorization: false
+      Integration:
+        Type: HTTP_PROXY
+        IntegrationHttpMethod: ANY
+        Uri: !Sub "http://${BackendHost}:3002/api/categories/{proxy}"
+        ConnectionType: INTERNET
+        RequestParameters:
+          integration.request.path.proxy: method.request.path.proxy
+          integration.request.header.Authorization: method.request.header.Authorization
+          integration.request.header.X-User-Role: context.authorizer.rol
+          integration.request.header.X-User-Id: context.authorizer.uid
+
+  CategoriesOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref CategoriesResource
+      HttpMethod: OPTIONS
+      # Critico: el preflight NO puede exigir token. Si llevara el authorizer,
+      # el navegador recibiria 401 en el OPTIONS y nunca enviaria la peticion real.
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,PATCH,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+              method.response.header.Access-Control-Max-Age: "'3600'"
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Max-Age: true
+
+  CategoriesProxyOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref CategoriesProxyResource
+      HttpMethod: OPTIONS
+      # Critico: el preflight NO puede exigir token. Si llevara el authorizer,
+      # el navegador recibiria 401 en el OPTIONS y nunca enviaria la peticion real.
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,PATCH,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+              method.response.header.Access-Control-Max-Age: "'3600'"
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Max-Age: true
+
+  # --------------------------- Metodos: /api/orders ---------------------------
+  OrdersMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref OrdersResource
+      HttpMethod: ANY
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref JwtAuthorizer
+      RequestParameters:
+        method.request.header.Authorization: false
+      Integration:
+        Type: HTTP_PROXY
+        IntegrationHttpMethod: ANY
+        Uri: !Sub "http://${BackendHost}:3003/api/orders"
+        ConnectionType: INTERNET
+        RequestParameters:
+          integration.request.header.Authorization: method.request.header.Authorization
+          integration.request.header.X-User-Role: context.authorizer.rol
+          integration.request.header.X-User-Id: context.authorizer.uid
+
+  OrdersProxyMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref OrdersProxyResource
+      HttpMethod: ANY
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref JwtAuthorizer
+      RequestParameters:
+        method.request.path.proxy: true
+        method.request.header.Authorization: false
+      Integration:
+        Type: HTTP_PROXY
+        IntegrationHttpMethod: ANY
+        Uri: !Sub "http://${BackendHost}:3003/api/orders/{proxy}"
+        ConnectionType: INTERNET
+        RequestParameters:
+          integration.request.path.proxy: method.request.path.proxy
+          integration.request.header.Authorization: method.request.header.Authorization
+          integration.request.header.X-User-Role: context.authorizer.rol
+          integration.request.header.X-User-Id: context.authorizer.uid
+
+  OrdersOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref OrdersResource
+      HttpMethod: OPTIONS
+      # Critico: el preflight NO puede exigir token. Si llevara el authorizer,
+      # el navegador recibiria 401 en el OPTIONS y nunca enviaria la peticion real.
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,PATCH,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+              method.response.header.Access-Control-Max-Age: "'3600'"
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Max-Age: true
+
+  OrdersProxyOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref OrdersProxyResource
+      HttpMethod: OPTIONS
+      # Critico: el preflight NO puede exigir token. Si llevara el authorizer,
+      # el navegador recibiria 401 en el OPTIONS y nunca enviaria la peticion real.
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,PATCH,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+              method.response.header.Access-Control-Max-Age: "'3600'"
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Max-Age: true
+
+  # ---------------------------------------------------------------------
+  # Respuestas de error del propio Gateway.
+  # Sin esto, un 401 del authorizer llega al navegador SIN cabeceras CORS y el
+  # frontend ve un error de CORS confuso en vez del 401 real.
+  # ---------------------------------------------------------------------
+  UnauthorizedGatewayResponse:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      RestApiId: !Ref RestApi
+      ResponseType: UNAUTHORIZED
+      StatusCode: "401"
+      ResponseParameters:
+        gatewayresponse.header.Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+        gatewayresponse.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+      ResponseTemplates:
+        application/json: '{"status":401,"error":"Unauthorized","message":"Token JWT ausente, invalido o expirado"}'
+
+  AccessDeniedGatewayResponse:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      RestApiId: !Ref RestApi
+      ResponseType: ACCESS_DENIED
+      StatusCode: "403"
+      ResponseParameters:
+        gatewayresponse.header.Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+        gatewayresponse.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+      ResponseTemplates:
+        application/json: '{"status":403,"error":"Forbidden","message":"Acceso denegado por la politica del API Gateway"}'
+
+  Default4xxGatewayResponse:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      RestApiId: !Ref RestApi
+      ResponseType: DEFAULT_4XX
+      ResponseParameters:
+        gatewayresponse.header.Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+        gatewayresponse.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+
+  Default5xxGatewayResponse:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      RestApiId: !Ref RestApi
+      ResponseType: DEFAULT_5XX
+      ResponseParameters:
+        gatewayresponse.header.Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+        gatewayresponse.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+
+  # ---------------------------------------------------------------------
+  # Despliegue y stage
+  # ---------------------------------------------------------------------
+  Deployment:
+    Type: AWS::ApiGateway::Deployment
+    # Sin DependsOn, CloudFormation puede desplegar antes de crear los metodos
+    # y publicar una API vacia.
+    DependsOn:
+      - AuthMethod
+      - AuthProxyMethod
+      - UsersMethod
+      - UsersProxyMethod
+      - ProductsMethod
+      - ProductsProxyMethod
+      - CategoriesMethod
+      - CategoriesProxyMethod
+      - OrdersMethod
+      - OrdersProxyMethod
+    Properties:
+      RestApiId: !Ref RestApi
+      Description: !Sub "Despliegue del pipeline CI/CD - ${DeploymentNonce}"
+
+  Stage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref RestApi
+      DeploymentId: !Ref Deployment
+      StageName: !Ref StageName
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          # Limites de peticiones: el equivalente practico al "breaker" del diagrama,
+          # protege a las EC2 de una avalancha de trafico.
+          ThrottlingRateLimit: 50
+          ThrottlingBurstLimit: 100
+          MetricsEnabled: true
+
+# ===========================================================================
+# SALIDAS
+# ===========================================================================
+Outputs:
+
+  ApiUrl:
+    Description: URL base del API Gateway. Es el unico punto de entrada publico.
+    Value: !Sub "https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}"
+    Export:
+      Name: SmartLogixApiUrl
+
+  ShippingQueueUrl:
+    Description: URL de la cola SQS. Hay que pasarla a orders-service como SQS_QUEUE_URL.
+    Value: !Ref ShippingQueue
+    Export:
+      Name: SmartLogixShippingQueueUrl
+
+  ShippingQueueArn:
+    Value: !GetAtt ShippingQueue.Arn
+
+  ShippingDlqUrl:
+    Description: Cola de mensajes fallidos, para inspeccionar errores de la Lambda.
+    Value: !Ref ShippingDlq
+
+  JwtAuthorizerFunctionName:
+    Value: !Ref JwtAuthorizerFunction
+
+  ShippingFunctionName:
+    Value: !Ref ShippingFunction

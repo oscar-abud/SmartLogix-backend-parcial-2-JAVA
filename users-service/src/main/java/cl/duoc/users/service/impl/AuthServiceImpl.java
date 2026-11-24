@@ -3,43 +3,58 @@ package cl.duoc.users.service.impl;
 import cl.duoc.users.dto.LoginRequest;
 import cl.duoc.users.dto.LoginResponse;
 import cl.duoc.users.exception.UnauthorizedException;
+import cl.duoc.users.model.Usuario;
+import cl.duoc.users.repository.UsuarioRepository;
+import cl.duoc.users.security.JwtService;
 import cl.duoc.users.service.AuthService;
-import cl.duoc.users.service.RoleValidator;
-import org.springframework.beans.factory.annotation.Value;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 /**
- * Login con credenciales fijas para cada rol (definidas en application.yml, seccion "auth").
+ * Login real contra la tabla "usuarios".
+ *
+ * A diferencia de la EP2 (que comparaba contra dos credenciales fijas del
+ * application.yml y no emitia token), aqui se busca el usuario por email o por
+ * nombre de usuario, se verifica la password con BCrypt y se devuelve un JWT.
  */
+@Slf4j
 @Service
+@RequiredArgsConstructor
 public class AuthServiceImpl implements AuthService {
 
-    private final String usuarioAdmin;
-    private final String passwordAdmin;
-    private final String usuarioOperador;
-    private final String passwordOperador;
+    private static final String CREDENCIALES_INVALIDAS = "Usuario o password incorrectos";
 
-    public AuthServiceImpl(@Value("${auth.admin.usuario}") String usuarioAdmin,
-                           @Value("${auth.admin.password}") String passwordAdmin,
-                           @Value("${auth.operador.usuario}") String usuarioOperador,
-                           @Value("${auth.operador.password}") String passwordOperador) {
-        this.usuarioAdmin = usuarioAdmin;
-        this.passwordAdmin = passwordAdmin;
-        this.usuarioOperador = usuarioOperador;
-        this.passwordOperador = passwordOperador;
-    }
+    private final UsuarioRepository usuarioRepository;
+    private final PasswordEncoder passwordEncoder;
+    private final JwtService jwtService;
 
     @Override
+    @Transactional(readOnly = true)
     public LoginResponse login(LoginRequest request) {
-        String usuario = request.usuario();
-        String password = request.password();
+        String identificador = request.usuario().trim();
 
-        if (usuario.equals(usuarioAdmin) && password.equals(passwordAdmin)) {
-            return new LoginResponse("Login exitoso", usuario, RoleValidator.ADMIN);
-        } else if (usuario.equals(usuarioOperador) && password.equals(passwordOperador)) {
-            return new LoginResponse("Login exitoso", usuario, RoleValidator.OPERADOR);
-        } else {
-            throw new UnauthorizedException("Usuario o password incorrectos");
+        Usuario usuario = usuarioRepository.findByEmailIgnoreCase(identificador)
+                .orElseThrow(() -> {
+                    log.debug("Login fallido: no existe el usuario {}", identificador);
+                    return new UnauthorizedException(CREDENCIALES_INVALIDAS);
+                });
+
+        if (Boolean.FALSE.equals(usuario.getActive())) {
+            throw new UnauthorizedException("El usuario esta desactivado");
         }
+
+        if (!passwordEncoder.matches(request.password(), usuario.getPassword())) {
+            log.debug("Login fallido: password incorrecta para {}", identificador);
+            throw new UnauthorizedException(CREDENCIALES_INVALIDAS);
+        }
+
+        String token = jwtService.generarToken(usuario);
+        log.info("Login exitoso de {} con rol {}", usuario.getEmail(), usuario.getRol());
+
+        return LoginResponse.exitoso(usuario.getEmail(), usuario.getRol(),
+                token, jwtService.getExpiracionSegundos());
     }
 }

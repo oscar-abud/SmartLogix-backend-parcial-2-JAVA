@@ -1,0 +1,172 @@
+# ---------------------------------------------------------------------------
+# Stack de DOCKER SWARM para el despliegue en AWS EC2 (IE7 / IE8).
+#
+# Diferencias clave respecto a docker-compose.yml (entorno local):
+#   - Las imagenes NO se construyen aqui: vienen ya publicadas en GHCR por el
+#     pipeline de CI/CD, etiquetadas con el SHA del commit.
+#   - Los microservicios declaran "deploy", que solo interpreta Swarm:
+#     replicas, politica de actualizacion, reinicio y limites de recursos.
+#   - La red es overlay, de modo que los contenedores se ven entre nodos.
+#   - Las bases de datos quedan ancladas al nodo manager porque sus volumenes
+#     son locales a cada nodo (ver ARQUITECTURA.md).
+#
+# Despliegue:   ./infra/scripts/deploy-stack.sh
+# Escalado:     docker service scale smartlogix_orders-service=4
+# Estado:       docker stack services smartlogix
+# ---------------------------------------------------------------------------
+version: "3.8"
+
+x-deploy-microservicio: &deploy-microservicio
+  replicas: 2
+  update_config:
+    parallelism: 1
+    delay: 15s
+    order: start-first      # levanta la replica nueva antes de bajar la vieja: sin corte
+    failure_action: rollback
+  rollback_config:
+    parallelism: 1
+  restart_policy:
+    condition: on-failure
+    delay: 10s
+    max_attempts: 3
+  resources:
+    limits:
+      memory: 512M
+    reservations:
+      memory: 256M
+
+x-deploy-bd: &deploy-bd
+  replicas: 1
+  placement:
+    constraints: [node.role == manager]   # el volumen vive en el disco del manager
+  restart_policy:
+    condition: on-failure
+  resources:
+    limits:
+      memory: 384M
+
+services:
+
+  # --------------------------- Bases de datos ---------------------------
+  users-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: users_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+    secrets: [db_password]
+    volumes:
+      - users_data:/var/lib/postgresql/data
+    networks: [smartlogix-net]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d users_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy: *deploy-bd
+
+  inventory-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: inventory_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+    secrets: [db_password]
+    volumes:
+      - inventory_data:/var/lib/postgresql/data
+    networks: [smartlogix-net]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d inventory_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy: *deploy-bd
+
+  orders-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: orders_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+    secrets: [db_password]
+    volumes:
+      - orders_data:/var/lib/postgresql/data
+    networks: [smartlogix-net]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d orders_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy: *deploy-bd
+
+  # --------------------------- Microservicios ---------------------------
+  users-service:
+    image: ghcr.io/oscar-abud/smartlogix-users-service:${TAG:-latest}
+    environment:
+      SERVER_PORT: 3001
+      DB_HOST: users-db
+      DB_PORT: 5432
+      DB_NAME: users_db
+      DB_USER: postgres
+      DB_PASSWORD: ${DB_PASSWORD:-postgres}
+      JWT_SECRET: ${JWT_SECRET:?Debe exportar JWT_SECRET antes de desplegar}
+      JWT_EXPIRATION_MS: ${JWT_EXPIRATION_MS:-3600000}
+    ports:
+      - target: 3001
+        published: 3001
+        mode: ingress        # routing mesh: responde desde cualquier nodo del cluster
+    networks: [smartlogix-net]
+    deploy: *deploy-microservicio
+
+  inventory-service:
+    image: ghcr.io/oscar-abud/smartlogix-inventory-service:${TAG:-latest}
+    environment:
+      SERVER_PORT: 3002
+      DB_HOST: inventory-db
+      DB_PORT: 5432
+      DB_NAME: inventory_db
+      DB_USER: postgres
+      DB_PASSWORD: ${DB_PASSWORD:-postgres}
+      JWT_SECRET: ${JWT_SECRET:?Debe exportar JWT_SECRET antes de desplegar}
+    ports:
+      - target: 3002
+        published: 3002
+        mode: ingress
+    networks: [smartlogix-net]
+    deploy: *deploy-microservicio
+
+  orders-service:
+    image: ghcr.io/oscar-abud/smartlogix-orders-service:${TAG:-latest}
+    environment:
+      SERVER_PORT: 3003
+      DB_HOST: orders-db
+      DB_PORT: 5432
+      DB_NAME: orders_db
+      DB_USER: postgres
+      DB_PASSWORD: ${DB_PASSWORD:-postgres}
+      JWT_SECRET: ${JWT_SECRET:?Debe exportar JWT_SECRET antes de desplegar}
+      # DNS interno de la red overlay; Swarm balancea entre las replicas de inventory.
+      INVENTORY_URL: http://inventory-service:3002
+      # Productor del flujo asincrono hacia la Lambda de envios.
+      SQS_QUEUE_URL: ${SQS_QUEUE_URL:-}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+    ports:
+      - target: 3003
+        published: 3003
+        mode: ingress
+    networks: [smartlogix-net]
+    deploy: *deploy-microservicio
+
+networks:
+  smartlogix-net:
+    driver: overlay
+    attachable: true
+
+volumes:
+  users_data:
+  inventory_data:
+  orders_data:
+
+secrets:
+  db_password:
+    external: true          # se crea una vez: ver infra/scripts/swarm-init-manager.sh

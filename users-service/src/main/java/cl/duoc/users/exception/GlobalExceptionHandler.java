@@ -6,6 +6,8 @@ import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.security.access.AccessDeniedException;
+import org.springframework.security.core.AuthenticationException;
 import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.MissingRequestHeaderException;
@@ -87,6 +89,26 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(DataIntegrityViolationException.class)
     public ResponseEntity<ErrorResponse> handleDataIntegrity(DataIntegrityViolationException ex, HttpServletRequest req) {
         return build(HttpStatus.CONFLICT, "La operacion viola una restriccion de integridad de datos", req, List.of());
+    }
+
+    /**
+     * Denegacion lanzada por PreAuthorize (seguridad a nivel de metodo).
+     *
+     * Sin este handler la excepcion caeria en el handler generico de Exception y el
+     * cliente recibiria un 500 en vez de un 403. Las denegaciones que ocurren en la
+     * cadena de filtros no pasan por aqui: esas las atiende JwtAuthEntryPoint.
+     */
+    @ExceptionHandler(AccessDeniedException.class)
+    public ResponseEntity<ErrorResponse> handleAccessDenied(AccessDeniedException ex, HttpServletRequest req) {
+        return build(HttpStatus.FORBIDDEN,
+                "Acceso denegado: su rol no tiene permiso para esta operacion", req, List.of());
+    }
+
+    /** Fallo de autenticacion propagado desde Spring Security. */
+    @ExceptionHandler(AuthenticationException.class)
+    public ResponseEntity<ErrorResponse> handleAuthentication(AuthenticationException ex, HttpServletRequest req) {
+        return build(HttpStatus.UNAUTHORIZED,
+                "Token JWT ausente, invalido o expirado", req, List.of());
     }
 
     @ExceptionHandler(Exception.class)

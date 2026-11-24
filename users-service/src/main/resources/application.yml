@@ -1,11 +1,14 @@
 server:
-  port: ${SERVER_PORT:8081}
+  port: ${SERVER_PORT:3001}
+  # Necesario detras de API Gateway / Load Balancer: hace que la cabecera Location
+  # se construya con el host publico y no con la IP interna de la EC2.
+  forward-headers-strategy: framework
 
 spring:
   application:
     name: users-service
   datasource:
-    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5441}/${DB_NAME:users_db}
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:users_db}
     username: ${DB_USER:postgres}
     password: ${DB_PASSWORD:postgres}
   jpa:
@@ -17,11 +20,28 @@ spring:
       hibernate:
         format_sql: true
 
-# Credenciales del login (POST /api/auth/login)
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: never
+
+# Firma de los JWT (HS256). El mismo secreto lo usan inventory, orders y la Lambda authorizer.
+jwt:
+  secret: ${JWT_SECRET:smartlogix-dev-secret-cambiar-en-produccion-minimo-32-bytes}
+  expiration-ms: ${JWT_EXPIRATION_MS:3600000}
+  issuer: smartlogix-users
+
+# Usuarios sembrados al arrancar si la tabla "usuarios" esta vacia (ver DataInitializer).
 auth:
+  seed:
+    enabled: ${AUTH_SEED_ENABLED:true}
   admin:
-    usuario: ${AUTH_ADMIN_USER:admin}
+    usuario: ${AUTH_ADMIN_USER:admin@smartlogix.cl}
     password: ${AUTH_ADMIN_PASSWORD:admin123}
   operador:
-    usuario: ${AUTH_OPERADOR_USER:operador}
+    usuario: ${AUTH_OPERADOR_USER:operador@smartlogix.cl}
     password: ${AUTH_OPERADOR_PASSWORD:operador123}

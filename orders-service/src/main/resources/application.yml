@@ -1,11 +1,12 @@
 server:
-  port: ${SERVER_PORT:8083}
+  port: ${SERVER_PORT:3003}
+  forward-headers-strategy: framework
 
 spring:
   application:
     name: orders-service
   datasource:
-    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5443}/${DB_NAME:orders_db}
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5434}/${DB_NAME:orders_db}
     username: ${DB_USER:postgres}
     password: ${DB_PASSWORD:postgres}
   jpa:
@@ -17,6 +18,26 @@ spring:
       hibernate:
         format_sql: true
 
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: never
+
 # URL de inventory-service, de donde se obtiene el precio real de cada producto
 inventory:
-  base-url: ${INVENTORY_URL:http://localhost:8082}
+  base-url: ${INVENTORY_URL:http://localhost:3002}
+
+# Solo valida tokens: debe compartir el secreto con users-service.
+jwt:
+  secret: ${JWT_SECRET:smartlogix-dev-secret-cambiar-en-produccion-minimo-32-bytes}
+  issuer: smartlogix-users
+
+# Cola SQS donde se publica el evento de pedido creado (lo consume la Lambda shipping).
+# Si queda vacia, la publicacion se omite con un warning (modo local sin AWS).
+sqs:
+  shipping-queue-url: ${SQS_QUEUE_URL:}
+  region: ${AWS_REGION:us-east-1}
